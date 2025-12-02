@@ -93,7 +93,6 @@ public:
   uint64_t RequestOutputs(uint64_t output_bits);
   void OutputGPIO(uint64_t output_bits);
 
-  void Clear();
 private:
   friend class RGBMatrix;
 
@@ -122,9 +121,10 @@ class RGBMatrix::Impl::UpdateThread : public Thread {
 public:
   UpdateThread(GPIO *io, FrameCanvas *initial_frame,
                int pwm_dither_bits, bool show_refresh,
-               int limit_refresh_hz)
+               int limit_refresh_hz, bool allow_busy_waiting)
     : io_(io), show_refresh_(show_refresh),
       target_frame_usec_(limit_refresh_hz < 1 ? 0 : 1e6/limit_refresh_hz),
+      allow_busy_waiting_(allow_busy_waiting),
       running_(true),
       current_frame_(initial_frame), next_frame_(NULL),
       requested_frame_multiple_(1) {
@@ -199,8 +199,13 @@ public:
       ++low_bit_sequence;
 
       if (target_frame_usec_) {
-        while ((GetMicrosecondCounter() - start_time_us) < target_frame_usec_) {
-          // busy wait. We have our dedicated core, so ok to burn cycles.
+        if (allow_busy_waiting_) {
+          while ((GetMicrosecondCounter() - start_time_us) < target_frame_usec_) {
+            // busy wait. We have our dedicated core, so ok to burn cycles.
+          }
+        } else {
+          long spent_us = GetMicrosecondCounter() - start_time_us;
+          SleepMicroseconds(target_frame_usec_ - spent_us);
         }
       }
 
@@ -245,6 +250,7 @@ private:
   GPIO *const io_;
   const bool show_refresh_;
   const uint32_t target_frame_usec_;
+  const bool allow_busy_waiting_;
   uint32_t start_bit_[4];
 
   Mutex running_mutex_;
@@ -314,9 +320,14 @@ RGBMatrix::Options::Options() :
   pixel_mapper_config(NULL),
   panel_type(NULL),
 #ifdef FIXED_FRAME_MICROSECONDS
-  limit_refresh_rate_hz(1e6 / FIXED_FRAME_MICROSECONDS)
+  limit_refresh_rate_hz(1e6 / FIXED_FRAME_MICROSECONDS),
 #else
-  limit_refresh_rate_hz(0)
+  limit_refresh_rate_hz(0),
+#endif
+#ifdef DISABLE_BUSY_WAITING
+    disable_busy_waiting(true)
+#else
+    disable_busy_waiting(false)
 #endif
 {
   // Nothing to see here.
@@ -348,6 +359,7 @@ static void PrintOptions(const RGBMatrix::Options &o) {
   P_STR(pixel_mapper_config);
   P_STR(panel_type);
   P_INT(limit_refresh_rate_hz);
+  P_BOOL(disable_busy_waiting);
 #undef P_INT
 #undef P_STR
 #undef P_BOOL
@@ -412,17 +424,17 @@ RGBMatrix::~RGBMatrix() {
 }
 
 uint64_t RGBMatrix::Impl::RequestInputs(uint64_t bits) {
-  return io_->RequestInputs(bits);
+  return io_->RequestInputs(static_cast<gpio_bits_t>(bits));
 }
 
 uint64_t RGBMatrix::Impl::RequestOutputs(uint64_t output_bits) {
-  uint64_t success_bits = io_->InitOutputs(output_bits);
+  uint64_t success_bits = io_->InitOutputs(static_cast<gpio_bits_t>(output_bits));
   user_output_bits_ |= success_bits;
   return success_bits;
 }
 
 void RGBMatrix::Impl::OutputGPIO(uint64_t output_bits) {
-  io_->WriteMaskedBits(output_bits, user_output_bits_);
+  io_->WriteMaskedBits(static_cast<gpio_bits_t>(output_bits), static_cast<gpio_bits_t>(user_output_bits_));
 }
 
 void RGBMatrix::Impl::ApplyNamedPixelMappers(const char *pixel_mapper_config,
@@ -469,7 +481,8 @@ bool RGBMatrix::Impl::StartRefresh() {
   if (updater_ == NULL && io_ != NULL) {
     updater_ = new UpdateThread(io_, active_, params_.pwm_dither_bits,
                                 params_.show_refresh_rate,
-                                params_.limit_refresh_rate_hz);
+                                params_.limit_refresh_rate_hz,
+                                !params_.disable_busy_waiting);
     // If we have multiple processors, the kernel
     // jumps around between these, creating some global flicker.
     // So let's tie it to the last CPU available.
@@ -572,20 +585,51 @@ bool RGBMatrix::Impl::ApplyPixelMapper(const PixelMapper *mapper) {
   }
   PixelDesignatorMap *new_mapper = new PixelDesignatorMap(
     new_width, new_height, shared_pixel_mapper_->GetFillColorBits());
-  for (int y = 0; y < new_height; ++y) {
-    for (int x = 0; x < new_width; ++x) {
-      int orig_x = -1, orig_y = -1;
-      mapper->MapVisibleToMatrix(old_width, old_height,
-                                 x, y, &orig_x, &orig_y);
-      if (orig_x < 0 || orig_y < 0 ||
-          orig_x >= old_width || orig_y >= old_height) {
-        fprintf(stderr, "Error in PixelMapper: (%d, %d) -> (%d, %d) [range: "
-                "%dx%d]\n", x, y, orig_x, orig_y, old_width, old_height);
-        continue;
+  switch (mapper->GetMappingType()) {
+    case PixelMapper::VisibleToMatrix:
+      for (int y = 0; y < new_height; ++y) {
+        for (int x = 0; x < new_width; ++x) {
+          int orig_x = -1, orig_y = -1;
+          mapper->MapVisibleToMatrix(old_width, old_height,
+                                     x, y, &orig_x, &orig_y);
+          if (orig_x < 0 || orig_y < 0 ||
+              orig_x >= old_width || orig_y >= old_height) {
+            fprintf(stderr, "Error in PixelMapper: (%d, %d) -> (%d, %d) [range: "
+                    "%dx%d]\n", x, y, orig_x, orig_y, old_width, old_height);
+            continue;
+          }
+          const internal::PixelDesignator *orig_designator;
+          orig_designator = shared_pixel_mapper_->get(orig_x, orig_y);
+          *new_mapper->get(x, y) = *orig_designator;
+        }
       }
-      const internal::PixelDesignator *orig_designator;
-      orig_designator = shared_pixel_mapper_->get(orig_x, orig_y);
-      *new_mapper->get(x, y) = *orig_designator;
+      break;
+    case PixelMapper::MatrixToVisible: {
+      bool collision_reported = false;
+      for (int y = 0; y < old_height; ++y) {
+        for (int x = 0; x < old_width; ++x) {
+          int new_x = -1, new_y = -1;
+          if (mapper->MapMatrixToVisible(old_width, old_height,
+                                         x, y, &new_x, &new_y)) {
+            if (new_x < 0 || new_y < 0 ||
+                new_x >= new_width || new_y >= new_height) {
+              fprintf(stderr, "Error in PixelMapper MapMatrixToVisible: (%d, %d) "
+                      "-> (%d, %d) [range: %dx%d]\n",
+                      x, y, new_x, new_y, new_width, new_height);
+              continue;
+            }
+            const internal::PixelDesignator *orig_designator;
+            orig_designator = shared_pixel_mapper_->get(x, y);
+            internal::PixelDesignator *new_designator = new_mapper->get(new_x, new_y);
+            if (new_designator->gpio_word >= 0 && !collision_reported) {
+              fprintf(stderr, "Warning: MapMatrixToVisible: %s mapped twice to the same pixel (%d, %d) -> (%d, %d)\n", mapper->GetName(), x, y, new_x, new_y);
+              collision_reported = true;
+            }
+            *new_designator = *orig_designator;
+          }
+        }
+      }
+      break;
     }
   }
   delete shared_pixel_mapper_;
@@ -644,7 +688,9 @@ RGBMatrix *RGBMatrix::CreateFromOptions(const RGBMatrix::Options &options,
   }
 
   // For the Pi4, we might need 2, maybe up to 4. Let's open up to 5.
-  if (runtime_options.gpio_slowdown < 0 || runtime_options.gpio_slowdown > 5) {
+  // on supported architectures, -1 will emit memory barier (DSB ST) after GPIO write
+  if (runtime_options.gpio_slowdown < (LED_MATRIX_ALLOW_BARRIER_DELAY ? -1 : 0)
+      || runtime_options.gpio_slowdown > 10) {
     fprintf(stderr, "--led-slowdown-gpio=%d is outside usable range\n",
             runtime_options.gpio_slowdown);
     return NULL;
@@ -771,6 +817,9 @@ void FrameCanvas::SetPixels(int x, int y, int width, int height,
 void FrameCanvas::Clear() { return frame_->Clear(); }
 void FrameCanvas::Fill(uint8_t red, uint8_t green, uint8_t blue) {
   frame_->Fill(red, green, blue);
+}
+void FrameCanvas::SubFill(int x, int y, int width, int height, uint8_t red, uint8_t green, uint8_t blue) {
+  frame_->SubFill(x, y, width, height, red, green, blue);
 }
 bool FrameCanvas::SetPWMBits(uint8_t value) { return frame_->SetPWMBits(value); }
 uint8_t FrameCanvas::pwmbits() { return frame_->pwmbits(); }

@@ -22,24 +22,24 @@ except Exception:
 # Configuration for the matrix
 options = RGBMatrixOptions()
 options.rows = 32
-options.cols = 64
+options.cols = 32
 options.chain_length = 1
 options.parallel = 1
-options.hardware_mapping = 'adafruit-hat-pwm'  # If you have an Adafruit HAT: 'adafruit-hat'
+options.hardware_mapping = 'regular'  # If you have an Adafruit HAT: 'adafruit-hat'
 
 matrix = RGBMatrix(options = options)
 
 # Preprocess the gifs frames into canvases to improve playback performance
-canvases = []
+frames = []
+canvas = matrix.CreateFrameCanvas()
 print("Preprocessing gif, this may take a moment depending on the size of the gif...")
 for frame_index in range(0, num_frames):
     gif.seek(frame_index)
     # must copy the frame out of the gif, since thumbnail() modifies the image in-place
     frame = gif.copy()
-    frame.thumbnail((matrix.width, matrix.height), Image.ANTIALIAS)
-    canvas = matrix.CreateFrameCanvas()
-    canvas.SetImage(frame.convert("RGB"))
-    canvases.append(canvas)
+    frame.thumbnail((matrix.width, matrix.height), Image.LANCZOS)
+    frames.append(frame.convert("RGB"))
+
 # Close the gif file to save memory now that we have copied out all of the frames
 gif.close()
 
@@ -51,7 +51,8 @@ try:
     # Infinitely loop through the gif
     cur_frame = 0
     while(True):
-        matrix.SwapOnVSync(canvases[cur_frame], framerate_fraction=100)
+        canvas.SetImage(frames[cur_frame])
+        matrix.SwapOnVSync(canvas, framerate_fraction=10)
         if cur_frame == num_frames - 1:
             cur_frame = 0
         else:
